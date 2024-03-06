@@ -1425,10 +1425,12 @@ VkResult WrappedVulkan::vkBeginCommandBuffer(VkCommandBuffer commandBuffer,
 
     if(pBeginInfo->pInheritanceInfo)
     {
-      record->MarkResourceFrameReferenced(GetResID(pBeginInfo->pInheritanceInfo->renderPass),
-                                          eFrameRef_Read);
-      record->MarkResourceFrameReferenced(GetResID(pBeginInfo->pInheritanceInfo->framebuffer),
-                                          eFrameRef_Read);
+      if(pBeginInfo->pInheritanceInfo->renderPass != VK_NULL_HANDLE)
+        record->MarkResourceFrameReferenced(GetResID(pBeginInfo->pInheritanceInfo->renderPass),
+                                            eFrameRef_Read);
+      if(pBeginInfo->pInheritanceInfo->framebuffer != VK_NULL_HANDLE)
+        record->MarkResourceFrameReferenced(GetResID(pBeginInfo->pInheritanceInfo->framebuffer),
+                                            eFrameRef_Read);
     }
   }
 
