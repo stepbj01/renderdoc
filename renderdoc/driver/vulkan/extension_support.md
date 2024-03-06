@@ -75,6 +75,7 @@ Maintainers can update this file by updating vk.xml in this folder and running `
 * `VK_EXT_metal_surface`
 * `VK_EXT_multisampled_render_to_single_sampled`
 * `VK_EXT_mutable_descriptor_type`
+* `VK_EXT_nested_command_buffer`
 * `VK_EXT_non_seamless_cube_map`
 * `VK_EXT_pageable_device_local_memory`
 * `VK_EXT_pci_bus_info`

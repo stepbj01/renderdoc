@@ -653,6 +653,17 @@ private:
 
   const VkFormatProperties &GetFormatProperties(VkFormat f);
 
+  struct Submission
+  {
+    Submission(uint32_t eid = 0, ResourceId resid = ResourceId(), bool rpactive = false)
+        : baseEvent(eid), cmdId(resid), renderPassActive(rpactive)
+    {
+    }
+    uint32_t baseEvent = 0;
+    ResourceId cmdId = ResourceId();
+    bool renderPassActive = false;
+  };
+
   struct BakedCmdBufferInfo
   {
     BakedCmdBufferInfo()
@@ -735,59 +746,44 @@ private:
   };
   rdcarray<ActionUse> m_ActionUses;
 
-  enum PartialReplayIndex
-  {
-    Primary,
-    Secondary,
-    ePartialNum
-  };
-
-  struct Submission
-  {
-    Submission(uint32_t eid) : baseEvent(eid), rebased(false) {}
-    uint32_t baseEvent = 0;
-    bool rebased = false;
-  };
-
-  // by definition, when replaying we must have N completely submitted command buffers, and at most
-  // two partially-submitted command buffers. One primary, that we're part-way through, and then
-  // if we're part-way through a vkCmdExecuteCommandBuffers inside that primary then there's one
-  // secondary.
+  // during active replay, command buffers may be partially-submitted if the selected event occurs
+  // within the range of the command buffer. If secondary command buffers are used and the selected
+  // event occurs within the range of a secondary, both the secondary and the command buffer that
+  // executed it are considered partially-submitted. If VK_EXT_nested_command_buffer is enabled,
+  // there may be up to N partially-submitted command buffers, where N is the maximum command
+  // nesting depth used in the capture.
   struct PartialReplayData
   {
     PartialReplayData() { Reset(); }
     void Reset()
     {
-      partialParent = ResourceId();
-      baseEvent = 0;
-      renderPassActive = false;
+      isPartialPrimary = false;
+      currentPartial = ResourceId();
+      partialSubmits.clear();
     }
 
-    // this records where in the frame a command buffer was submitted, so that we know if our replay
-    // range ends in one of these ranges we need to construct a partial command buffer for future
+    // this tracks the command buffers that are actually partial during replay. These are used to
+    // track whether a render pass is active or not during partial replay. For the most part, we
+    // only care about the partial command buffer we are currently replaying, but there is a case
+    // where we need to save the state of the partial stack and restore it (see ReplayLog())
+    std::map<ResourceId, Submission> partialSubmits;
+    bool isPartialPrimary;
+    ResourceId currentPartial;
+
+    // this records the absolute position where a command buffer was submitted in a frame. This is
+    // used during replay to determine the event range of a command buffer. If the replay ends in
+    // one of these ranges we need to construct a partial command buffer for future
     // replaying. Note that we always have the complete command buffer around - it's the bakeID
     // itself.
-    // Since we only ever record a bakeID once the key is unique - note that the same command buffer
-    // could be recorded multiple times a frame, so the parent command buffer ID (the one recorded
-    // in vkCmd chunks) is NOT unique.
-    // However, a single baked command list can be submitted multiple times - so we have to have a
-    // list of base events
-    // Note in the case of secondary command buffers we mark when these are rebased to 'absolute'
-    // event IDs, since they could be submitted multiple times in the frame and we don't want to
-    // rebase all of them each time.
-    // Map from bakeID -> vector<Submission>
-    std::map<ResourceId, rdcarray<Submission>> cmdBufferSubmits;
+    // a single command buffer may be submitted multiple times in a frame by different parent command
+    // buffers. Each of these submissions would have a different absolute position in the capture.
+    std::map<ResourceId, rdcarray<uint32_t>> rebasedSubmits;
 
-    // identifies the baked ID of the command buffer that's actually partial at each level.
-    ResourceId partialParent;
-
-    // the base even of the submission that's partial, as defined above in partialParent
-    uint32_t baseEvent;
-
-    // whether a renderpass is currently active in the partial recording - as with baseEvent, only
-    // valid for the command buffer referred to by partialParent.
-    bool renderPassActive;
-  } m_Partial[ePartialNum];
+    // this records where in a parent command buffer a secondary buffer was submitted
+    // event IDs recorded here are relative to the start of the parent, and is used during
+    // ReplayQueueSubmit to produce the absolute positions in rebasedSubmits.
+    std::map<ResourceId, rdcarray<Submission>> relativeSubmits;
+  } m_Partial;
 
   // if we're replaying just a single action or a particular command
   // buffer subsection of command events, we don't go through the
@@ -814,9 +810,11 @@ private:
   bool HasRerecordCmdBuf(ResourceId cmdid);
   bool ShouldUpdateRenderState(ResourceId cmdid, bool forcePrimary = false);
   bool IsRenderpassOpen(ResourceId cmdid);
-  VkCommandBuffer RerecordCmdBuf(ResourceId cmdid, PartialReplayIndex partialType = ePartialNum);
+  VkCommandBuffer RerecordCmdBuf(ResourceId cmdid);
 
   ResourceId GetPartialCommandBuffer();
+
+  void UpdateRenderStateForSecondaries(BakedCmdBufferInfo &ancestorCB, BakedCmdBufferInfo &currentCB);
 
   // this info is stored in the record on capture, but we
   // need it on replay too
@@ -1030,8 +1028,14 @@ private:
   bool PatchIndirectDraw(size_t drawIndex, uint32_t paramStride, VkIndirectPatchType type,
                          ActionDescription &action, byte *&argptr, byte *argend);
   void InsertActionsAndRefreshIDs(BakedCmdBufferInfo &cmdBufInfo);
+  void AddReferencesForSecondaries(VkResourceRecord *record,
+                                   rdcarray<VkResourceRecord *> &cmdsWithReferences,
+                                   std::unordered_set<ResourceId> &refdIDs);
+  void AddRecordsForSecondaries(VkResourceRecord *record);
+  void UpdateImageStatesForSecondaries(VkResourceRecord *record);
   void CaptureQueueSubmit(VkQueue queue, const rdcarray<VkCommandBuffer> &commandBuffers,
                           VkFence fence);
+  void RebaseSubmitsForSecondaries(const ResourceId &parentCmd, uint32_t curBaseEvent);
   void ReplayQueueSubmit(VkQueue queue, VkSubmitInfo2 submitInfo, rdcstr basename);
   void InternalFlushMemoryRange(VkDevice device, const VkMappedMemoryRange &memRange,
                                 bool internalFlush, bool capframe);

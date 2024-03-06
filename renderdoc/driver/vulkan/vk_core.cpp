@@ -1111,6 +1111,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_EXT_MUTABLE_DESCRIPTOR_TYPE_SPEC_VERSION,
     },
     {
+        VK_EXT_NESTED_COMMAND_BUFFER_EXTENSION_NAME,
+        VK_EXT_NESTED_COMMAND_BUFFER_SPEC_VERSION,
+    },
+    {
         VK_EXT_NON_SEAMLESS_CUBE_MAP_EXTENSION_NAME,
         VK_EXT_NON_SEAMLESS_CUBE_MAP_SPEC_VERSION,
     },
@@ -4159,8 +4163,7 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
   {
     if(!partial)
     {
-      m_Partial[Primary].Reset();
-      m_Partial[Secondary].Reset();
+      m_Partial.Reset();
       m_RenderState = VulkanRenderState();
       for(auto it = m_BakedCmdBufferInfo.begin(); it != m_BakedCmdBufferInfo.end(); it++)
         it->second.state = VulkanRenderState();
@@ -4173,7 +4176,7 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
 
     VkResult vkr = VK_SUCCESS;
 
-    bool rpWasActive[2] = {};
+    std::map<ResourceId, Submission> prevSubmissionState = {};
 
     // we'll need our own command buffer if we're replaying just a subsection
     // of events within a single command buffer record - always if it's only
@@ -4202,10 +4205,20 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
       m_RenderState.subpassContents = VK_SUBPASS_CONTENTS_INLINE;
       m_RenderState.dynamicRendering.flags &= ~VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
 
-      rpWasActive[Primary] = m_Partial[Primary].renderPassActive;
-      rpWasActive[Secondary] = m_Partial[Secondary].renderPassActive;
+      prevSubmissionState = m_Partial.partialSubmits;
 
-      if(rpWasActive[Primary] || rpWasActive[Secondary])
+      bool rpActive = false;
+
+      for(const auto &partialSubmit : prevSubmissionState)
+      {
+        if(partialSubmit.second.renderPassActive)
+        {
+          rpActive = true;
+          break;
+        }
+      }
+
+      if(rpActive)
       {
         const ActionDescription *action = GetAction(endEventID);
 
@@ -4285,14 +4298,20 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
       // even if it wasn't before (if the above event was a CmdBeginRenderPass).
       // If we began our own custom single-action loadrp, and it was ended by a CmdEndRenderPass,
       // we need to reverse the virtual transitions we did above, as it won't happen otherwise
-      if(m_Partial[Primary].renderPassActive || m_Partial[Secondary].renderPassActive)
-        m_RenderState.EndRenderPass(cmd);
+      for(const auto &partialSubmit : m_Partial.partialSubmits)
+      {
+        if(partialSubmit.second.renderPassActive)
+        {
+          m_RenderState.EndRenderPass(cmd);
+          break;
+        }
+      }
 
-      // we might have replayed a CmdBeginRenderPass or CmdEndRenderPass,
-      // but we want to keep the partial replay data state intact, so restore
-      // whether or not a render pass was active.
-      m_Partial[Primary].renderPassActive = rpWasActive[Primary];
-      m_Partial[Secondary].renderPassActive = rpWasActive[Secondary];
+      for(const auto &partialSubmit : prevSubmissionState)
+      {
+        m_Partial.partialSubmits[partialSubmit.first].renderPassActive =
+            partialSubmit.second.renderPassActive;
+      }
 
       ObjDisp(cmd)->EndCommandBuffer(Unwrap(cmd));
 
@@ -4779,16 +4798,9 @@ bool WrappedVulkan::InRerecordRange(ResourceId cmdid)
   if(m_OutsideCmdBuffer != VK_NULL_HANDLE)
     return true;
 
-  // if not, check if we're one of the actual partial command buffers and check to see if we're in
-  // the range for their partial replay.
-  for(int p = 0; p < ePartialNum; p++)
-  {
-    if(cmdid == m_Partial[p].partialParent)
-    {
-      return m_BakedCmdBufferInfo[m_Partial[p].partialParent].curEventID + m_Partial[p].baseEvent <=
-             m_LastEventID;
-    }
-  }
+  if(m_Partial.partialSubmits.count(cmdid))
+    return m_BakedCmdBufferInfo[cmdid].curEventID + m_Partial.partialSubmits[cmdid].baseEvent <=
+           m_LastEventID;
 
   // otherwise just check if we have a re-record command buffer for this, as then we're doing a full
   // re-record and replay of the command buffer
@@ -4811,16 +4823,13 @@ bool WrappedVulkan::ShouldUpdateRenderState(ResourceId cmdid, bool forcePrimary)
   // if forcePrimary is set we're tracking renderpass activity that only happens in the primary
   // command buffer. So even if a secondary is partial, we still want to check it.
   if(forcePrimary)
-    return m_Partial[Primary].partialParent == cmdid;
+    return (cmdid == m_Partial.currentPartial) && m_Partial.isPartialPrimary;
 
   // otherwise, if a secondary command buffer is partial we want to *ignore* any state setting
   // happening in the primary buffer as fortunately no state is inherited (so we don't need to
   // worry about any state before the execute) and any state setting recorded afterwards would
   // incorrectly override what we have.
-  if(m_Partial[Secondary].partialParent != ResourceId())
-    return cmdid == m_Partial[Secondary].partialParent;
-
-  return cmdid == m_Partial[Primary].partialParent;
+  return cmdid == m_Partial.currentPartial;
 }
 
 bool WrappedVulkan::IsRenderpassOpen(ResourceId cmdid)
@@ -4828,20 +4837,13 @@ bool WrappedVulkan::IsRenderpassOpen(ResourceId cmdid)
   if(m_OutsideCmdBuffer != VK_NULL_HANDLE)
     return true;
 
-  // if not, check if we're one of the actual partial command buffers and check to see if we're in
-  // the range for their partial replay.
-  for(int p = 0; p < ePartialNum; p++)
-  {
-    if(cmdid == m_Partial[p].partialParent)
-    {
-      return m_BakedCmdBufferInfo[cmdid].renderPassOpen;
-    }
-  }
+  if(m_Partial.partialSubmits.count(cmdid) != 0)
+    return m_BakedCmdBufferInfo[cmdid].renderPassOpen;
 
   return false;
 }
 
-VkCommandBuffer WrappedVulkan::RerecordCmdBuf(ResourceId cmdid, PartialReplayIndex partialType)
+VkCommandBuffer WrappedVulkan::RerecordCmdBuf(ResourceId cmdid)
 {
   if(m_OutsideCmdBuffer != VK_NULL_HANDLE)
     return m_OutsideCmdBuffer;
@@ -4859,9 +4861,7 @@ VkCommandBuffer WrappedVulkan::RerecordCmdBuf(ResourceId cmdid, PartialReplayInd
 
 ResourceId WrappedVulkan::GetPartialCommandBuffer()
 {
-  if(m_Partial[Secondary].partialParent != ResourceId())
-    return m_Partial[Secondary].partialParent;
-  return m_Partial[Primary].partialParent;
+  return m_Partial.currentPartial;
 }
 
 void WrappedVulkan::AddAction(const ActionDescription &a)

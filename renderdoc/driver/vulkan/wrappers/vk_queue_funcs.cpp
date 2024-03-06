@@ -249,6 +249,17 @@ void WrappedVulkan::DoSubmit(VkQueue queue, VkSubmitInfo2 submitInfo)
   }
 }
 
+void WrappedVulkan::RebaseSubmitsForSecondaries(const ResourceId &parentCmd, uint32_t curBaseEvent)
+{
+  const rdcarray<Submission> &submitRecords = m_Partial.relativeSubmits[parentCmd];
+
+  for(const auto &submit : submitRecords)
+  {
+    m_Partial.rebasedSubmits[submit.cmdId].push_back(submit.baseEvent + curBaseEvent);
+    RebaseSubmitsForSecondaries(submit.cmdId, submit.baseEvent + curBaseEvent);
+  }
+}
+
 void WrappedVulkan::ReplayQueueSubmit(VkQueue queue, VkSubmitInfo2 submitInfo, rdcstr basename)
 {
   if(IsLoading(m_State))
@@ -307,20 +318,7 @@ void WrappedVulkan::ReplayQueueSubmit(VkQueue queue, VkSubmitInfo2 submitInfo, r
       // and drawIDs
       InsertActionsAndRefreshIDs(cmdBufInfo);
 
-      for(size_t e = 0; e < cmdBufInfo.action->executedCmds.size(); e++)
-      {
-        rdcarray<Submission> &submits =
-            m_Partial[Secondary].cmdBufferSubmits[cmdBufInfo.action->executedCmds[e]];
-
-        for(size_t s = 0; s < submits.size(); s++)
-        {
-          if(!submits[s].rebased)
-          {
-            submits[s].baseEvent += m_RootEventID;
-            submits[s].rebased = true;
-          }
-        }
-      }
+      RebaseSubmitsForSecondaries(cmd, m_RootEventID);
 
       for(size_t i = 0; i < cmdBufInfo.debugMessages.size(); i++)
       {
@@ -329,7 +327,7 @@ void WrappedVulkan::ReplayQueueSubmit(VkQueue queue, VkSubmitInfo2 submitInfo, r
       }
 
       // only primary command buffers can be submitted
-      m_Partial[Primary].cmdBufferSubmits[cmd].push_back(Submission(m_RootEventID));
+      m_Partial.rebasedSubmits[cmd].push_back(m_RootEventID);
 
       m_RootEventID += cmdBufInfo.eventCount;
       m_RootActionID += cmdBufInfo.actionCount;
@@ -733,18 +731,6 @@ void WrappedVulkan::InsertActionsAndRefreshIDs(BakedCmdBufferInfo &cmdBufInfo)
             m_BakedCmdBufferInfo[n.indirectPatch.commandBuffer].actionCount += eidShift;
           }
 
-          for(size_t e = 0; e < cmdBufInfo.action->executedCmds.size(); e++)
-          {
-            rdcarray<Submission> &submits =
-                m_Partial[Secondary].cmdBufferSubmits[cmdBufInfo.action->executedCmds[e]];
-
-            for(size_t s = 0; s < submits.size(); s++)
-            {
-              if(submits[s].baseEvent >= cmdBufNodes[i].action.eventId + 2)
-                submits[s].baseEvent += eidShift;
-            }
-          }
-
           RDCASSERT(cmdBufNodes[i + 1].action.events.size() == 1);
           uint32_t chunkIndex = cmdBufNodes[i + 1].action.events[0].chunkIndex;
 
@@ -906,6 +892,50 @@ void WrappedVulkan::InsertActionsAndRefreshIDs(BakedCmdBufferInfo &cmdBufInfo)
   }
 }
 
+void WrappedVulkan::AddReferencesForSecondaries(VkResourceRecord *record,
+                                                rdcarray<VkResourceRecord *> &cmdsWithReferences,
+                                                std::unordered_set<ResourceId> &refdIDs)
+{
+  const rdcarray<VkResourceRecord *> &subcmds = record->bakedCommands->cmdInfo->subcmds;
+
+  for(auto &subcmd : subcmds)
+  {
+    cmdsWithReferences.push_back(subcmd->bakedCommands);
+
+    subcmd->bakedCommands->AddReferencedIDs(refdIDs);
+
+    GetResourceManager()->MarkResourceFrameReferenced(subcmd->cmdInfo->allocRecord->GetResourceID(),
+                                                      eFrameRef_Read);
+
+    subcmd->bakedCommands->AddRef();
+
+    AddReferencesForSecondaries(subcmd, cmdsWithReferences, refdIDs);
+  }
+}
+
+void WrappedVulkan::AddRecordsForSecondaries(VkResourceRecord *record)
+{
+  const rdcarray<VkResourceRecord *> &subcmds = record->bakedCommands->cmdInfo->subcmds;
+
+  for(auto &subcmd : subcmds)
+  {
+    m_CmdBufferRecords.push_back(subcmd->bakedCommands);
+    AddRecordsForSecondaries(subcmd);
+  }
+}
+
+void WrappedVulkan::UpdateImageStatesForSecondaries(VkResourceRecord *record)
+{
+  const rdcarray<VkResourceRecord *> &subcmds = record->bakedCommands->cmdInfo->subcmds;
+
+  for(auto &subcmd : subcmds)
+  {
+    subcmd->bakedCommands->AddResourceReferences(GetResourceManager());
+    UpdateImageStates(subcmd->bakedCommands->cmdInfo->imageStates);
+    UpdateImageStatesForSecondaries(subcmd);
+  }
+}
+
 void WrappedVulkan::CaptureQueueSubmit(VkQueue queue,
                                        const rdcarray<VkCommandBuffer> &commandBuffers, VkFence fence)
 {
@@ -972,31 +1002,12 @@ void WrappedVulkan::CaptureQueueSubmit(VkQueue queue,
       GetResourceManager()->MarkResourceFrameReferenced(
           record->cmdInfo->allocRecord->GetResourceID(), eFrameRef_Read);
 
-      const rdcarray<VkResourceRecord *> &subcmds = record->bakedCommands->cmdInfo->subcmds;
-
-      for(size_t sub = 0; sub < subcmds.size(); sub++)
-      {
-        VkResourceRecord *bakedSubcmds = subcmds[sub]->bakedCommands;
-
-        // cannot add references here until after we've done descriptor sets later, see comment
-        // above
-        // bakedSubcmds->AddResourceReferences(GetResourceManager());
-        // GetResourceManager()->MergeReferencedMemory(bakedSubcmds->cmdInfo->memFrameRefs);
-        // UpdateImageStates(bakedSubcmds->cmdInfo->imageStates);
-        cmdsWithReferences.push_back(bakedSubcmds);
-
-        bakedSubcmds->AddReferencedIDs(refdIDs);
-        GetResourceManager()->MarkResourceFrameReferenced(
-            subcmds[sub]->cmdInfo->allocRecord->GetResourceID(), eFrameRef_Read);
-
-        bakedSubcmds->AddRef();
-      }
+      AddReferencesForSecondaries(record, cmdsWithReferences, refdIDs);
 
       {
         SCOPED_LOCK(m_CmdBufferRecordsLock);
         m_CmdBufferRecords.push_back(record->bakedCommands);
-        for(size_t sub = 0; sub < subcmds.size(); sub++)
-          m_CmdBufferRecords.push_back(subcmds[sub]->bakedCommands);
+        AddRecordsForSecondaries(record);
       }
 
       record->bakedCommands->AddRef();
@@ -1025,12 +1036,7 @@ void WrappedVulkan::CaptureQueueSubmit(VkQueue queue,
 
       record->bakedCommands->AddResourceReferences(GetResourceManager());
       UpdateImageStates(record->bakedCommands->cmdInfo->imageStates);
-
-      for(VkResourceRecord *sub : record->bakedCommands->cmdInfo->subcmds)
-      {
-        sub->bakedCommands->AddResourceReferences(GetResourceManager());
-        UpdateImageStates(sub->bakedCommands->cmdInfo->imageStates);
-      }
+      UpdateImageStatesForSecondaries(record);
     }
 
     // every 20 submits clean background references, in case the application isn't presenting.
